@@ -3560,6 +3560,7 @@ dependencies = [
  "egui",
  "env_logger",
  "evdev",
+ "gdk",
  "gtk",
  "image",
  "log",

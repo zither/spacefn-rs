@@ -8,6 +8,7 @@ use core::{
     State, StateMachine,
 };
 use eframe::egui;
+use eframe::egui::ViewportCommand;
 use evdev::EventType;
 use image::io::Reader as ImageReader;
 use nix::sys::select::{select, FdSet};
@@ -15,15 +16,22 @@ use nix::sys::time::TimeVal;
 use std::io::Cursor;
 use std::os::fd::AsRawFd;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 use tray_icon::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuEvent, MenuItem},
     Icon, TrayIconBuilder,
 };
 use ui::{CoreCommand, SpacefnApp, UiMessage};
 
 const KEY_SPACE: u16 = 57;
 const DECIDE_TIMEOUT_MS: u64 = 200;
+
+#[derive(Clone, Debug)]
+enum TrayCommand {
+    ShowWindow,
+    Quit,
+}
 
 fn init_logging() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -121,7 +129,7 @@ fn run_state_machine(
 fn run_idle_state(
     device: &mut evdev::Device,
     uinput: &mut evdev::uinput::VirtualDevice,
-    config: &Config,
+    _config: &Config,
     state_tx: &mpsc::Sender<UiMessage>,
     _cmd_rx: &mpsc::Receiver<CoreCommand>,
 ) -> anyhow::Result<State> {
@@ -265,7 +273,73 @@ fn send_mapped_key(
     Ok(mapped_code != 0 && mapped_code != code)
 }
 
-fn run_ui(state_rx: mpsc::Receiver<UiMessage>, cmd_tx: mpsc::Sender<CoreCommand>) {
+fn spawn_tray_thread(tray_tx: mpsc::Sender<TrayCommand>) {
+    std::thread::spawn(move || {
+        if gtk::init().is_err() {
+            log::warn!("Failed to initialize GTK with default settings");
+            std::env::set_var("GDK_BACKEND", "x11");
+            if gtk::init().is_err() {
+                log::error!("Failed to initialize GTK even with X11 backend");
+                return;
+            }
+        }
+        log::info!("GTK initialized successfully");
+
+        let icon_bytes = include_bytes!("../resources/icon.png");
+        let icon_image = ImageReader::new(Cursor::new(icon_bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        let rgba = icon_image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let icon = Icon::from_rgba(rgba.into_raw(), width, height).expect("Failed to create icon");
+
+        let show_item = MenuItem::new("显示窗口", true, None);
+        let quit_item = MenuItem::new("退出", true, None);
+        let menu = Menu::with_items(&[&show_item, &quit_item]).expect("Failed to create menu");
+
+        let show_item_id = show_item.id().clone();
+        let quit_item_id = quit_item.id().clone();
+
+        let _tray = TrayIconBuilder::new()
+            .with_icon(icon)
+            .with_tooltip("SpaceFN")
+            .with_menu(Box::new(menu))
+            .build()
+            .expect("Failed to build tray icon");
+        log::info!("Tray icon created successfully");
+
+        let tx = tray_tx.clone();
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            while gtk::events_pending() {
+                gtk::main_iteration();
+            }
+            if let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == show_item_id {
+                    log::info!("Show window clicked");
+                    let _ = tx.send(TrayCommand::ShowWindow);
+                } else if event.id == quit_item_id {
+                    log::info!("Quit clicked");
+                    let _ = tx.send(TrayCommand::Quit);
+                }
+            }
+            gtk::glib::Continue(true)
+        });
+
+        gtk::main();
+        std::mem::forget(_tray);
+    });
+}
+
+fn run_ui(
+    state_rx: mpsc::Receiver<UiMessage>,
+    cmd_tx: mpsc::Sender<CoreCommand>,
+    tray_rx: mpsc::Receiver<TrayCommand>,
+) {
+    let egui_ctx: Arc<std::sync::Mutex<Option<egui::Context>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([700.0, 600.0])
@@ -273,54 +347,25 @@ fn run_ui(state_rx: mpsc::Receiver<UiMessage>, cmd_tx: mpsc::Sender<CoreCommand>
         ..Default::default()
     };
 
-    // 创建系统托盘图标
-    let icon_bytes = include_bytes!("../resources/icon.png");
-    let icon_image = ImageReader::new(Cursor::new(icon_bytes))
-        .with_guessed_format()
-        .unwrap()
-        .decode()
-        .unwrap();
-    let rgba = icon_image.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    let icon = Icon::from_rgba(rgba.into_raw(), width, height).expect("Failed to create icon");
-
-    // 初始化 GTK
-    if gtk::init().is_err() {
-        log::error!("Failed to initialize GTK");
-    }
-
-    // 创建菜单
-    let show_item = MenuItem::new("显示窗口", true, None);
-    let quit_item = MenuItem::new("退出", true, None);
-    let menu = Menu::with_items(&[&show_item, &quit_item]).expect("Failed to create menu");
-
-    // 创建托盘图标
-    log::info!("Creating tray icon...");
-    let tray = TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_tooltip("SpaceFN")
-        .with_menu(Box::new(menu))
-        .build()
-        .expect("Failed to build tray icon");
-    log::info!("Tray icon created successfully");
-
-    // 确保 tray 不被 drop
-    std::mem::forget(tray);
-
     let state_rx = std::sync::Mutex::new(state_rx);
     let cmd_tx = std::sync::Mutex::new(cmd_tx);
+    let tray_rx = std::sync::Mutex::new(tray_rx);
 
     eframe::run_native(
         "SpaceFN",
         options,
-        Box::new(|_cc| {
+        Box::new(move |cc| {
+            *egui_ctx.lock().unwrap() = Some(cc.egui_ctx.clone());
             let mut app = SpacefnApp::new();
             app.reload_config();
             Box::new(SpacefnAppWrapper {
                 app,
                 state_rx,
-                cmd_tx,
-            }) as Box<dyn eframe::App>
+                _cmd_tx: cmd_tx,
+                tray_rx,
+                egui_ctx,
+                should_exit: false,
+            })
         }),
     )
     .unwrap();
@@ -329,11 +374,41 @@ fn run_ui(state_rx: mpsc::Receiver<UiMessage>, cmd_tx: mpsc::Sender<CoreCommand>
 struct SpacefnAppWrapper {
     app: SpacefnApp,
     state_rx: std::sync::Mutex<mpsc::Receiver<UiMessage>>,
-    cmd_tx: std::sync::Mutex<mpsc::Sender<CoreCommand>>,
+    _cmd_tx: std::sync::Mutex<mpsc::Sender<CoreCommand>>,
+    tray_rx: std::sync::Mutex<mpsc::Receiver<TrayCommand>>,
+    egui_ctx: Arc<std::sync::Mutex<Option<egui::Context>>>,
+    should_exit: bool,
 }
 
 impl eframe::App for SpacefnAppWrapper {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.should_exit {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        }
+
+        if let Ok(tray_rx) = self.tray_rx.lock() {
+            while let Ok(cmd) = tray_rx.try_recv() {
+                match cmd {
+                    TrayCommand::ShowWindow => {
+                        log::info!("Processing ShowWindow command");
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    }
+                    TrayCommand::Quit => {
+                        log::info!("Processing Quit command");
+                        self.should_exit = true;
+                    }
+                }
+            }
+        }
+
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
+
         if let Ok(state_rx) = self.state_rx.lock() {
             while let Ok(msg) = state_rx.try_recv() {
                 match msg {
@@ -344,6 +419,12 @@ impl eframe::App for SpacefnAppWrapper {
             }
         }
         self.app.update(ctx, _frame);
+
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 }
 
@@ -381,6 +462,11 @@ fn main() {
 
     let (state_tx, state_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (tray_tx, tray_rx) = mpsc::channel();
+
+    spawn_tray_thread(tray_tx);
+
+    std::thread::sleep(Duration::from_millis(100));
 
     let device_path_clone = device_path.clone();
     let config_clone = config.clone();
@@ -390,6 +476,6 @@ fn main() {
         }
     });
 
-    run_ui(state_rx, cmd_tx);
+    run_ui(state_rx, cmd_tx, tray_rx);
     let _ = core_handle.join();
 }

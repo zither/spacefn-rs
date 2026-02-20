@@ -1,0 +1,20 @@
+[package]
+name = "spacefn-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+evdev = "0.12"
+egui = "0.26"
+eframe = "0.26"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+dirs = "5.0"
+log = "0.4"
+env_logger = "0.10"
+nix = { version = "0.26", features = ["fs"] }
+tray-icon = "0.8"
+image = "0.24"
+gtk = "0.16"

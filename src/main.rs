@@ -1,27 +1,53 @@
 mod config;
 mod core;
+#[cfg(feature = "ui")]
 mod ui;
 
+use clap::Parser;
 use config::Config;
 use core::{
     create_uinput_device, forward_event, list_input_devices, open_device, send_key, KeyValue,
     State, StateMachine,
 };
+
+#[cfg(feature = "ui")]
 use eframe::egui;
+#[cfg(feature = "ui")]
 use eframe::egui::ViewportCommand;
 use evdev::EventType;
-use gtk::prelude::*;
+#[cfg(feature = "ui")]
 use libappindicator::AppIndicator;
 use nix::sys::select::{select, FdSet};
 use nix::sys::time::TimeVal;
 use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::time::Duration;
-use ui::{CoreCommand, SpacefnApp, UiMessage};
+#[cfg(feature = "ui")]
+use ui::SpacefnApp;
+
+#[derive(Debug, Clone)]
+pub enum UiMessage {
+    StateChanged(State),
+    KeyPressed(u16),
+    Error(String),
+}
+
+pub enum CoreCommand {
+    ReloadConfig,
+    Stop,
+}
 
 const KEY_SPACE: u16 = 57;
 const DECIDE_TIMEOUT_MS: u64 = 200;
 
+#[derive(Parser, Debug)]
+#[command(version, about = "SpaceFN - SpaceFN keyboard modifier")]
+struct Args {
+    #[arg(long, help = "Run in CLI mode without GUI")]
+    cli: bool,
+}
+
+#[cfg(feature = "ui")]
 #[derive(Clone, Debug)]
 enum TrayCommand {
     ShowWindow,
@@ -33,6 +59,38 @@ fn init_logging() {
         .format_timestamp_millis()
         .init();
     log::info!("spacefn-rs started");
+}
+
+fn run_cli_mode(device_path: &str, config: Config) {
+    log::info!("Running in CLI mode");
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (state_tx, _state_rx) = mpsc::channel();
+    drop(_state_rx);
+    if let Err(e) = run_state_machine(device_path, config, state_tx, cmd_rx) {
+        log::error!("Core error: {}", e);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn run_ui_mode(device_path: String, config: Config) {
+    let (state_tx, state_rx) = mpsc::channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (tray_tx, tray_rx) = mpsc::channel();
+
+    spawn_tray_thread(tray_tx);
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let device_path_clone = device_path.clone();
+    let config_clone = config.clone();
+    let core_handle = std::thread::spawn(move || {
+        if let Err(e) = run_state_machine(&device_path_clone, config_clone, state_tx, cmd_rx) {
+            log::error!("Core error: {}", e);
+        }
+    });
+
+    run_ui(state_rx, cmd_tx, tray_rx);
+    let _ = core_handle.join();
 }
 
 fn check_device_permissions(device_path: &str) -> anyhow::Result<()> {
@@ -268,7 +326,9 @@ fn send_mapped_key(
     Ok(mapped_code != 0 && mapped_code != code)
 }
 
+#[cfg(feature = "ui")]
 fn spawn_tray_thread(tray_tx: mpsc::Sender<TrayCommand>) {
+    use gtk::prelude::*;
     std::thread::spawn(move || {
         if gtk::init().is_err() {
             log::warn!("Failed to initialize GTK with default settings");
@@ -319,6 +379,7 @@ fn spawn_tray_thread(tray_tx: mpsc::Sender<TrayCommand>) {
     });
 }
 
+#[cfg(feature = "ui")]
 fn run_ui(
     state_rx: mpsc::Receiver<UiMessage>,
     cmd_tx: mpsc::Sender<CoreCommand>,
@@ -353,6 +414,7 @@ fn run_ui(
     .unwrap();
 }
 
+#[cfg(feature = "ui")]
 struct SpacefnAppWrapper {
     app: SpacefnApp,
     state_rx: std::sync::Mutex<mpsc::Receiver<UiMessage>>,
@@ -361,6 +423,7 @@ struct SpacefnAppWrapper {
     should_exit: bool,
 }
 
+#[cfg(feature = "ui")]
 impl eframe::App for SpacefnAppWrapper {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.should_exit {
@@ -410,6 +473,7 @@ impl eframe::App for SpacefnAppWrapper {
 }
 
 fn main() {
+    let args = Args::parse();
     init_logging();
 
     let config = match Config::load() {
@@ -441,22 +505,14 @@ fn main() {
         return;
     }
 
-    let (state_tx, state_rx) = mpsc::channel();
-    let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (tray_tx, tray_rx) = mpsc::channel();
-
-    spawn_tray_thread(tray_tx);
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    let device_path_clone = device_path.clone();
-    let config_clone = config.clone();
-    let core_handle = std::thread::spawn(move || {
-        if let Err(e) = run_state_machine(&device_path_clone, config_clone, state_tx, cmd_rx) {
-            log::error!("Core error: {}", e);
+    if args.cli {
+        run_cli_mode(&device_path, config);
+    } else {
+        #[cfg(feature = "ui")]
+        run_ui_mode(device_path, config);
+        #[cfg(not(feature = "ui"))]
+        {
+            log::error!("UI mode is not enabled. Build with --features ui to enable it.");
         }
-    });
-
-    run_ui(state_rx, cmd_tx, tray_rx);
-    let _ = core_handle.join();
+    }
 }

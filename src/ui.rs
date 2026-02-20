@@ -1,18 +1,11 @@
 use crate::core::State;
+#[cfg(feature = "ui")]
 use eframe::egui;
 
-#[derive(Debug, Clone)]
-pub enum UiMessage {
-    StateChanged(State),
-    KeyPressed(u16),
-    Error(String),
-}
+#[cfg(feature = "ui")]
+pub use crate::{CoreCommand, UiMessage};
 
-pub enum CoreCommand {
-    ReloadConfig,
-    Stop,
-}
-
+#[cfg(feature = "ui")]
 pub struct SpacefnApp {
     pub current_state: State,
     pub key_history: Vec<KeyEvent>,

@@ -3,18 +3,23 @@ name = "spacefn-rs"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["ui"]
+ui = ["dep:egui", "dep:eframe", "dep:gtk", "dep:libappindicator"]
+
 [dependencies]
 evdev = "0.12"
-egui = "0.26"
-eframe = "0.26"
+egui = { version = "0.26", optional = true }
+eframe = { version = "0.26", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
 crossbeam-channel = "0.5"
 dirs = "5.0"
 log = "0.4"
 env_logger = "0.10"
 nix = { version = "0.26", features = ["fs"] }
 image = "0.24"
-gtk = "0.16"
-libappindicator = "0.8"
+gtk = { version = "0.16", optional = true }
+libappindicator = { version = "0.8", optional = true }

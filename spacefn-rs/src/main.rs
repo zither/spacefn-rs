@@ -10,18 +10,15 @@ use core::{
 use eframe::egui;
 use eframe::egui::ViewportCommand;
 use evdev::EventType;
+use gtk::prelude::*;
 use image::io::Reader as ImageReader;
+use libappindicator::AppIndicator;
 use nix::sys::select::{select, FdSet};
 use nix::sys::time::TimeVal;
 use std::io::Cursor;
 use std::os::fd::AsRawFd;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
-    Icon, TrayIconBuilder,
-};
 use ui::{CoreCommand, SpacefnApp, UiMessage};
 
 const KEY_SPACE: u16 = 57;
@@ -285,50 +282,50 @@ fn spawn_tray_thread(tray_tx: mpsc::Sender<TrayCommand>) {
         }
         log::info!("GTK initialized successfully");
 
-        let icon_bytes = include_bytes!("../resources/icon.png");
-        let icon_image = ImageReader::new(Cursor::new(icon_bytes))
-            .with_guessed_format()
-            .unwrap()
-            .decode()
-            .unwrap();
-        let rgba = icon_image.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        let icon = Icon::from_rgba(rgba.into_raw(), width, height).expect("Failed to create icon");
+        let mut indicator = AppIndicator::new("spacefn-rs", "spacefn-icon");
+        indicator.set_status(libappindicator::AppIndicatorStatus::Active);
 
-        let show_item = MenuItem::new("显示窗口", true, None);
-        let quit_item = MenuItem::new("退出", true, None);
-        let menu = Menu::with_items(&[&show_item, &quit_item]).expect("Failed to create menu");
+        let icon_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let icon_path = icon_path.join("icon.png");
 
-        let show_item_id = show_item.id().clone();
-        let quit_item_id = quit_item.id().clone();
-
-        let _tray = TrayIconBuilder::new()
-            .with_icon(icon)
-            .with_tooltip("SpaceFN")
-            .with_menu(Box::new(menu))
-            .build()
-            .expect("Failed to build tray icon");
-        log::info!("Tray icon created successfully");
-
-        let tx = tray_tx.clone();
-        gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            while gtk::events_pending() {
-                gtk::main_iteration();
-            }
-            if let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == show_item_id {
-                    log::info!("Show window clicked");
-                    let _ = tx.send(TrayCommand::ShowWindow);
-                } else if event.id == quit_item_id {
-                    log::info!("Quit clicked");
-                    let _ = tx.send(TrayCommand::Quit);
+        if let Ok(icon_bytes) = std::fs::read(&icon_path) {
+            if let Ok(icon_image) = image::load_from_memory(&icon_bytes) {
+                let temp_dir = std::env::temp_dir();
+                let temp_icon_path = temp_dir.join("spacefn-tray-icon.png");
+                if icon_image.save(&temp_icon_path).is_ok() {
+                    indicator.set_icon_full(temp_icon_path.to_str().unwrap_or(""), "spacefn-icon");
+                    log::info!("Tray icon set from: {:?}", temp_icon_path);
                 }
             }
-            gtk::glib::Continue(true)
+        }
+
+        let mut menu = gtk::Menu::new();
+
+        let show_item = gtk::MenuItem::with_label("显示窗口");
+        let tx_show = tray_tx.clone();
+        show_item.connect_activate(move |_| {
+            log::info!("Show window clicked");
+            let _ = tx_show.send(TrayCommand::ShowWindow);
         });
+        menu.append(&show_item);
+
+        let quit_item = gtk::MenuItem::with_label("退出");
+        let tx_quit = tray_tx.clone();
+        quit_item.connect_activate(move |_| {
+            log::info!("Quit clicked");
+            let _ = tx_quit.send(TrayCommand::Quit);
+        });
+        menu.append(&quit_item);
+
+        menu.show_all();
+        indicator.set_menu(&mut menu);
+
+        log::info!("Tray icon created successfully");
 
         gtk::main();
-        std::mem::forget(_tray);
     });
 }
 
@@ -337,9 +334,6 @@ fn run_ui(
     cmd_tx: mpsc::Sender<CoreCommand>,
     tray_rx: mpsc::Receiver<TrayCommand>,
 ) {
-    let egui_ctx: Arc<std::sync::Mutex<Option<egui::Context>>> =
-        Arc::new(std::sync::Mutex::new(None));
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([700.0, 600.0])
@@ -354,8 +348,7 @@ fn run_ui(
     eframe::run_native(
         "SpaceFN",
         options,
-        Box::new(move |cc| {
-            *egui_ctx.lock().unwrap() = Some(cc.egui_ctx.clone());
+        Box::new(move |_cc| {
             let mut app = SpacefnApp::new();
             app.reload_config();
             Box::new(SpacefnAppWrapper {
@@ -363,7 +356,6 @@ fn run_ui(
                 state_rx,
                 _cmd_tx: cmd_tx,
                 tray_rx,
-                egui_ctx,
                 should_exit: false,
             })
         }),
@@ -376,7 +368,6 @@ struct SpacefnAppWrapper {
     state_rx: std::sync::Mutex<mpsc::Receiver<UiMessage>>,
     _cmd_tx: std::sync::Mutex<mpsc::Sender<CoreCommand>>,
     tray_rx: std::sync::Mutex<mpsc::Receiver<TrayCommand>>,
-    egui_ctx: Arc<std::sync::Mutex<Option<egui::Context>>>,
     should_exit: bool,
 }
 
@@ -430,6 +421,18 @@ impl eframe::App for SpacefnAppWrapper {
 
 fn main() {
     init_logging();
+
+    let icon_bytes = include_bytes!("../resources/icon.png");
+    let icon_image = ImageReader::new(Cursor::new(icon_bytes))
+        .with_guessed_format()
+        .unwrap()
+        .decode()
+        .unwrap();
+    let temp_dir = std::env::temp_dir();
+    let temp_icon_path = temp_dir.join("spacefn-tray-icon.png");
+    if icon_image.save(&temp_icon_path).is_err() {
+        log::warn!("Failed to save temp icon");
+    }
 
     let config = match Config::load() {
         Ok(c) => c,
